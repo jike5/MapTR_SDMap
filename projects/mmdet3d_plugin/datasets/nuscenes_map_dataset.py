@@ -22,7 +22,8 @@ from shapely import affinity, ops
 from shapely.geometry import LineString, box, MultiPolygon, MultiLineString
 from mmdet.datasets.pipelines import to_tensor
 import json
-
+import geopandas as gpd
+from .geo_opensfm import TopocentricConverter
 
 def add_rotation_noise(extrinsics, std=0.01, mean=0.0):
     #n = extrinsics.shape[0]
@@ -65,6 +66,22 @@ def add_translation_noise(extrinsics, std=0.01, mean=0.0):
     noise = torch.normal(mean, std=std, size=(3,))
     extrinsics[0:3, -1] += noise.numpy()
     return extrinsics
+
+
+def load_sd_map(sd_map_path, ref_latlonalt, highway_sets):
+    lat, lon, alt = ref_latlonalt
+    converter = TopocentricConverter(lat, lon, alt)
+    sd_map_raw = gpd.read_file(sd_map_path)
+    sd_map_data_dict = {}
+    for cls_name, cls_types in highway_sets.items():
+        cls_sd_data_raw = sd_map_raw[sd_map_raw['type'].isin(cls_types)]
+        cls_sd_data_topo_list = []
+        for _, row in cls_sd_data_raw.iterrows():
+            tmp_sd_data = list(row.geometry.coords)
+            tmp_sd_data_topo = [converter.to_topocentric(lonlat[1], lonlat[0], 0.)[:2] for lonlat in tmp_sd_data]
+            cls_sd_data_topo_list.append(tmp_sd_data_topo)
+        sd_map_data_dict[cls_name] = MultiLineString(cls_sd_data_topo_list)
+    return sd_map_data_dict
 
 class LiDARInstanceLines(object):
     """Line instance in LIDAR coordinates
@@ -488,7 +505,6 @@ class LiDARInstanceLines(object):
         return instances_tensor
 
 
-
 class VectorizedLocalMap(object):
     CLASS2LABEL = {
         'road_divider': 0,
@@ -508,7 +524,10 @@ class VectorizedLocalMap(object):
                  num_samples=250,
                  padding=False,
                  fixed_ptsnum_per_line=-1,
-                 padding_value=-10000,):
+                 padding_value=-10000,
+                 use_sd_vector=False,
+                 sd_maps=None,
+                 sd_map_data_path=None,):
         '''
         Args:
             fixed_ptsnum_per_line = -1 : no fixed num
@@ -523,9 +542,22 @@ class VectorizedLocalMap(object):
         self.polygon_classes = contour_classes
         self.nusc_maps = {}
         self.map_explorer = {}
+        self.sd_maps = {}
+        REF_LATLONALT = {'boston-seaport':(42.336849169438615, -71.05785369873047, 0.),
+                         'singapore-onenorth':(1.2882100868743724, 103.78475189208984, 0.),
+                         'singapore-hollandvillage':(1.2993652317780957, 103.78217697143555, 0.),
+                         'singapore-queenstown':(1.2782562240223188, 103.76741409301758, 0.)}
+        HIGHWAY_SETS = {
+            'truck_road': ['trunk', 'primary', 'secondary', 'tertiary', 'unclassified', 'residential', # road
+            'trunk_link', 'primary_link', 'secondary_link', 'tertiary_link'# road link
+            'living_street',  'road',]  # Special road  'service'
+            }
         for loc in self.MAPS:
             self.nusc_maps[loc] = NuScenesMap(dataroot=self.data_root, map_name=loc)
             self.map_explorer[loc] = NuScenesMapExplorer(self.nusc_maps[loc])
+            if use_sd_vector:
+                self.sd_maps[loc] = load_sd_map(osp.join(sd_map_data_path, f'{loc}.shp'),
+                    REF_LATLONALT[loc], HIGHWAY_SETS)
 
         self.patch_size = patch_size
         self.sample_dist = sample_dist
@@ -533,6 +565,8 @@ class VectorizedLocalMap(object):
         self.padding = padding
         self.fixed_num = fixed_ptsnum_per_line
         self.padding_value = padding_value
+        self.use_sd_vector = use_sd_vector
+        self.sd_maps = sd_maps
 
     def gen_vectorized_samples(self, location, lidar2global_translation, lidar2global_rotation):
         '''
@@ -581,8 +615,10 @@ class VectorizedLocalMap(object):
         anns_results = dict(
             gt_vecs_pts_loc=gt_instance,
             gt_vecs_label=gt_labels,
-
         )
+        if self.use_sd_vector:
+            sd_vector_anns = self.get_osm_geom(patch_box, patch_angle, location)
+            anns_results.update(dict(sd_vector_anns=sd_vector_anns))
         return anns_results
 
     def get_map_geom(self, patch_box, patch_angle, layer_names, location):
@@ -598,6 +634,31 @@ class VectorizedLocalMap(object):
                 geoms = self.get_ped_crossing_line(patch_box, patch_angle, location)
                 map_geom.append((layer_name, geoms))
         return map_geom
+
+    def get_osm_geom(self, patch_box, patch_angle, location):
+        patch_x = patch_box[0]
+        patch_y = patch_box[1]
+        patch = self.map_explorer.get_patch_coord(patch_box, patch_angle)
+        line_dict = {}
+        for cls_key, geom_line in self.sd_maps[location].items():
+            if geom_line.is_empty:
+                continue
+            new_line = geom_line.intersection(patch)
+            if not new_line.is_empty:
+                new_line = affinity.rotate(new_line, -patch_angle, origin=(patch_x, patch_y), use_radians=False)
+                new_line = affinity.affine_transform(new_line, [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
+            if cls_key not in line_dict.keys( ):
+                line_dict[cls_key] = []
+            if isinstance(new_line, Linestring):
+                line_dict[cls_key].append(np.array(new_line.coords))
+            else:
+                for line in new_line:
+                    if line.geom_type == 'MultiLineString' :
+                        for single_line in line.geoms:
+                            line_dict[cls_key].append(np.array(single_line.coords))
+                    elif line.geom_type == 'LineString':
+                        line_dict[cls_key].append(np.array(line.coords))
+        return line_dict
 
     def _one_type_line_geom_to_vectors(self, line_geom):
         line_vectors = []
@@ -915,6 +976,8 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
                  map_classes=None,
                  noise='None',
                  noise_std=0,
+                 use_sd_vector=False,
+                 sd_map_data_path='data/nuscenes/osm',
                  *args, 
                  **kwargs):
         super().__init__(*args, **kwargs)
@@ -933,13 +996,18 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
         self.padding_value = padding_value
         self.fixed_num = fixed_ptsnum_per_line
         self.eval_use_same_gt_sample_num_flag = eval_use_same_gt_sample_num_flag
+        
         self.vector_map = VectorizedLocalMap(kwargs['data_root'], 
                             patch_size=self.patch_size, map_classes=self.MAPCLASSES, 
                             fixed_ptsnum_per_line=fixed_ptsnum_per_line,
-                            padding_value=self.padding_value)
+                            padding_value=self.padding_value,
+                            use_sd_vector=use_sd_vector,
+                            sd_map_data_path=sd_map_data_path)
         self.is_vis_on_test = False
         self.noise = noise
         self.noise_std = noise_std
+        self.use_sd_vector = use_sd_vector
+
     @classmethod
     def get_map_classes(cls, map_classes=None):
         """Get class names of current dataset.
@@ -1013,6 +1081,21 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
                 gt_vecs_pts_loc = gt_vecs_pts_loc
         example['gt_labels_3d'] = DC(gt_vecs_label, cpu_only=False)
         example['gt_bboxes_3d'] = DC(gt_vecs_pts_loc, cpu_only=True)
+        if self.use_sd_vector:
+            assert 'sd_vector_anns' in anns_results
+            sd_vector_anns = anns_results['sd_vector_anns']
+            sd_map_graph = []
+            for category, polylines in sd_vector_anns.items():
+                if len(polylines) > 0:
+                    # interpolate the lines
+                    lines = GeoSeries(map(LineString, polylines))
+                    np_lines = [CustomParametrizeSDMapGraph.interpolate_line(line, n_points=self.fixed_num).astype(np.float32) \
+                             for line in list(lines)]
+                    sd_map_graph.extend(np_lines)
+            # then stack: num_polylines x n_points x 2
+            sd_map_graph = np.stack(sd_map_graph, axis=0) if len(sd_map_graph) > 0 \
+                else np.zeros([0, self.fixed_num, 2], dtype=np.float32)
+            example['sd_map_graph'] = DC(sd_map_graph, cpu_only=False)
         return example
 
     def prepare_train_data(self, index):
@@ -1376,6 +1459,32 @@ class CustomNuScenesLocalMapDataset(CustomNuScenesDataset):
         with open(self.map_ann_file,'r') as ann_f:
             gt_anns = json.load(ann_f)
         annotations = gt_anns['GTs']
+
+        # save for MapVR metrics
+        # import pdb; pdb.set_trace()
+        mapvr_results = []
+        for i in range(0, len(gt_anns)):
+            mapvr_single_frame = {"gt" : [], "dt": []}
+            gts = annotations[i]['vectors']
+            for gt in gts:
+                mapvr_single_frame['gt'].append(
+                    {'class' : gt['type'],
+                     'pts'   : gt['pts']}
+                )
+            dts = gen_results[i]['vectors']
+            for dt in dts:
+                mapvr_single_frame['dt'].append(
+                    {'class' : dt['type'],
+                     'pts'   : dt['pts'],
+                     'score' : dt['confidence_level']}
+                )
+            mapvr_results.append(copy.deepcopy(mapvr_single_frame))
+        # dump results to json file
+        mapvr_path = osp.join(osp.dirname(result_path), 'mapvr_result.json')
+        with open(mapvr_path, 'w') as f:
+            json.dump(mapvr_results, f, indent=4)
+        print(f'Save mapvr json file to {mapvr_path}\n')
+
         cls_gens, cls_gts = format_res_gt_by_classes(result_path,
                                                      gen_results,
                                                      annotations,
