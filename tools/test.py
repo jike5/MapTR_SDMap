@@ -19,10 +19,12 @@ from mmdet3d.datasets import build_dataset
 from projects.mmdet3d_plugin.datasets.builder import build_dataloader
 from mmdet3d.models import build_model
 from mmdet.apis import set_random_seed
-from projects.mmdet3d_plugin.bevformer.apis.test import custom_multi_gpu_test
+from projects.mmdet3d_plugin.bevformer.apis.test import custom_multi_gpu_test, custom_single_gpu_test
 from mmdet.datasets import replace_ImageToTensor
 import time
 import os.path as osp
+import datetime
+import json
 
 
 def parse_args():
@@ -193,7 +195,7 @@ def main():
     data_loader = build_dataloader(
         dataset,
         samples_per_gpu=samples_per_gpu,
-        workers_per_gpu=cfg.data.workers_per_gpu,
+        workers_per_gpu=0,
         dist=distributed,
         shuffle=False,
         nonshuffler_sampler=cfg.data.nonshuffler_sampler,
@@ -222,15 +224,15 @@ def main():
         model.PALETTE = dataset.PALETTE
 
     if not distributed:
-        assert False
-        # model = MMDataParallel(model, device_ids=[0])
+        model = MMDataParallel(model, device_ids=[0])
         # outputs = single_gpu_test(model, data_loader, args.show, args.show_dir)
+        outputs, outputs_coco = custom_single_gpu_test(model, data_loader)
     else:
         model = MMDistributedDataParallel(
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False)
-        outputs = custom_multi_gpu_test(model, data_loader, args.tmpdir,
+        outputs, outputs_coco = custom_multi_gpu_test(model, data_loader, args.tmpdir,
                                         args.gpu_collect)
 
     rank, _ = get_dist_info()
@@ -254,6 +256,15 @@ def main():
             ]:
                 eval_kwargs.pop(key, None)
             eval_kwargs.update(dict(metric=args.eval, **kwargs))
+
+            eval_result = {}
+            for output in outputs_coco:
+                eval_result[output["type"]] = output["evaluator"].summarize(output["results"])
+            date = datetime.datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
+            output_path = os.path.join(os.path.dirname(args.checkpoint), f"results_{date}.json")
+            with open(output_path, "w") as f:
+                json.dump(eval_result, f)
+            print(f"Results are written to {output_path}")
 
             print(dataset.evaluate(outputs, **eval_kwargs))
 
